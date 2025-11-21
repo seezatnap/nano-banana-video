@@ -9,6 +9,14 @@ export const runtime = 'nodejs'
 export const maxDuration = 300
 
 type InlinePart = { text?: string; inlineData?: { data?: string; mimeType?: string } }
+type StreamChunk = {
+  promptFeedback?: { blockReason?: string; blockReasonMessage?: string | null }
+  candidates?: {
+    finishReason?: string
+    content?: { parts?: InlinePart[] }
+    safetyRatings?: unknown
+  }[]
+}
 
 type TransformRequest = {
   clipId?: string
@@ -20,10 +28,11 @@ type TransformRequest = {
 function buildPrompt(prompt: string, hasPrevious: boolean) {
   const lines = [
     'You are nano banana, stylizing a video one frame at a time.',
-    'Keep framing identical to the source frame. Avoid camera moves, cropping, or aspect changes.',
+    'Start from the PREVIOUS RENDERED frame as your base. The current SOURCE frame tells you what changed—apply those changes (motion, pose, camera shift) while keeping the style from the previous output.',
+    'Match composition to the source where needed, but allow natural scene shifts shown in the source. Do not rigidly lock to prior layout; follow the scene transition indicated by the source.',
     hasPrevious
-      ? 'Use the previous stylized frame as the state to carry forward. Maintain characters, palette, lighting, and brush style while adapting layout to match the new source frame.'
-      : 'This is the first frame. Apply the style cleanly while keeping layout and proportions identical.',
+      ? 'Keep palette/brush/texture from the previous stylized frame, but redraw the new frame to reflect the source changes (animation state, camera move, subject movement).'
+      : 'This is the first frame. Apply the style cleanly while respecting the source framing.',
     'Output exactly one PNG at the same resolution as the source frame. No borders, text, or watermarks.',
     `Style prompt: ${prompt}`,
   ]
@@ -74,33 +83,85 @@ export async function POST(req: NextRequest) {
     const userParts: InlinePart[] = [{ text: buildPrompt(prompt, hasPrevious) }]
 
     if (prevPath && existsSync(prevPath)) {
-      userParts.push({ text: 'Previous stylized frame (state to carry forward):' })
+      userParts.push({ text: 'Previous stylized frame (your starting state):' })
       userParts.push({ inlineData: { data: await readBase64(prevPath), mimeType: 'image/png' } })
+      userParts.push({ text: 'Current source frame (what changed):' })
+      userParts.push({ inlineData: { data: await readBase64(sourcePath), mimeType: 'image/png' } })
+    } else {
+      userParts.push({ text: 'Next source frame to adapt:' })
+      userParts.push({ inlineData: { data: await readBase64(sourcePath), mimeType: 'image/png' } })
     }
 
-    userParts.push({ text: 'Next source frame to adapt:' })
-    userParts.push({ inlineData: { data: await readBase64(sourcePath), mimeType: 'image/png' } })
+    const allowedModels = new Set([
+      'gemini-2.5-flash-image-preview',
+      'gemini-3-pro-image-preview',
+    ])
+    const requestedModel = process.env.GEMINI_IMAGE_MODEL
+    const model =
+      requestedModel && allowedModels.has(requestedModel)
+        ? requestedModel
+        : DEFAULT_GEMINI_IMAGE_MODEL
 
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_IMAGE_MODEL || DEFAULT_GEMINI_IMAGE_MODEL,
+    const stream = await ai.models.generateContentStream({
+      model,
+      config: { responseModalities: ['IMAGE'] },
       contents: [{ role: 'user', parts: userParts }],
-      config: { responseModalities: ['IMAGE'], temperature: 0.8 },
     })
 
-    const candidate = response.response?.candidates?.[0]
-    const parts = (candidate?.content?.parts || []) as InlinePart[]
-    const imagePart = parts.find((p) => p.inlineData?.data)?.inlineData
+    let imageBase64: string | null = null
+    let chunkCount = 0
+    let candidateInfo: StreamChunk['candidates'][number] | null = null
+    let blockReason: string | null = null
+    let blockReasonMessage: string | null = null
+    let safetyRatings: unknown
+    let promptFeedback: StreamChunk['promptFeedback'] | null = null
 
-    if (!imagePart?.data) {
-      const blockReason =
-        response.response?.promptFeedback?.blockReason || candidate?.finishReason || 'UNKNOWN'
+    for await (const rawChunk of stream) {
+      const chunk = rawChunk as StreamChunk
+      chunkCount++
+      if (chunk.promptFeedback?.blockReason) {
+        blockReason = chunk.promptFeedback.blockReason || null
+        blockReasonMessage = chunk.promptFeedback.blockReasonMessage || null
+        promptFeedback = chunk.promptFeedback
+        break
+      }
+      if (chunk.candidates && chunk.candidates.length > 0) {
+        const candidate = chunk.candidates[0]
+        candidateInfo = candidate
+        safetyRatings = candidate.safetyRatings || safetyRatings
+        if (candidate.content?.parts) {
+          for (const part of candidate.content.parts) {
+            if (part.inlineData?.data) {
+              imageBase64 = part.inlineData.data
+              break
+            }
+          }
+          if (imageBase64) break
+        }
+      }
+    }
+
+    if (!imageBase64) {
+      const diagnostics: Record<string, unknown> = {
+        model,
+        chunkCount,
+        promptFeedback,
+        blockReason,
+        blockReasonMessage,
+        candidateFinishReason: candidateInfo?.finishReason,
+        safetyRatings,
+      }
       return NextResponse.json(
-        { error: `Model did not return an image. Reason: ${blockReason}` },
-        { status: 502 }
+        {
+          error: `Model did not return an image. Reason: ${blockReason || candidateInfo?.finishReason || 'UNKNOWN'}`,
+          code: blockReason || candidateInfo?.finishReason || 'NO_IMAGE_RETURNED',
+          details: diagnostics,
+        },
+        { status: blockReason ? 422 : 502 }
       )
     }
 
-    const buffer = Buffer.from(imagePart.data, 'base64')
+    const buffer = Buffer.from(imageBase64, 'base64')
     await fs.writeFile(targetPath, buffer)
 
     return NextResponse.json({
@@ -108,6 +169,21 @@ export async function POST(req: NextRequest) {
     })
   } catch (error) {
     console.error('Transform failed:', error)
-    return NextResponse.json({ error: 'Failed to transform frame' }, { status: 500 })
+    const err = error as { message?: string; status?: number; code?: number; response?: unknown }
+    const rawMessage = typeof err?.message === 'string' ? err.message : ''
+    const serviceUnavailable =
+      rawMessage.toLowerCase().includes('model is overloaded') ||
+      err?.status === 503 ||
+      err?.code === 503
+
+    const details = err?.response ? { response: err.response } : undefined
+    const message = serviceUnavailable
+      ? 'Gemini is under load. Please retry in a moment.'
+      : 'Failed to transform frame'
+
+    return NextResponse.json(
+      { error: message, details },
+      { status: serviceUnavailable ? 503 : 500 }
+    )
   }
 }

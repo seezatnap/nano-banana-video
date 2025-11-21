@@ -10,7 +10,8 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 300
 export const runtime = 'nodejs'
 
-const FPS = 10
+const DEFAULT_FPS = 10
+const MAX_FPS = 30
 const FRAME_PATTERN = 'frame_%04d.png'
 
 async function persistUpload(file: File, target: string) {
@@ -23,6 +24,10 @@ function parseNumber(value: FormDataEntryValue | null, fallback = 0) {
   if (typeof value !== 'string') return fallback
   const parsed = Number.parseFloat(value)
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n))
 }
 
 async function runCommand(cmd: FfmpegCommand) {
@@ -42,6 +47,8 @@ export async function POST(req: NextRequest) {
     const start = Math.max(0, parseNumber(formData.get('start'), 0))
     const end = parseNumber(formData.get('end'), 0)
     const durationExplicit = parseNumber(formData.get('duration'), 0)
+    const requestedFps = parseNumber(formData.get('fps'), DEFAULT_FPS)
+    const fps = clamp(requestedFps || DEFAULT_FPS, 1, MAX_FPS)
     const requestedDuration = durationExplicit > 0 ? durationExplicit : Math.max(0, end - start)
 
     if (!video || !(video instanceof File)) {
@@ -73,7 +80,7 @@ export async function POST(req: NextRequest) {
       .seekInput(start)
       .duration(requestedDuration)
       .output(frameOutput)
-      .outputOptions(['-vf', `fps=${FPS}`])
+      .outputOptions(['-vf', `fps=${fps}`])
 
     await runCommand(extractCmd)
 
@@ -96,8 +103,9 @@ export async function POST(req: NextRequest) {
 
     const payload = {
       clipId,
-      fps: FPS,
+      fps,
       duration: Number(requestedDuration.toFixed(3)),
+      inputUrl: `/runs/${clipId}/input${ext}`,
       frames: frameNames.map((name) => ({
         name,
         url: `/runs/${clipId}/source/${name}`,

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import path from 'path'
 import fs from 'fs/promises'
-import { existsSync, copyFileSync } from 'fs'
+import { existsSync, copyFileSync, statSync } from 'fs'
 import { ffmpeg, ensureFfmpegAvailable } from '@/lib/ffmpeg'
 import type { FfmpegCommand } from 'fluent-ffmpeg'
 
@@ -20,14 +20,42 @@ async function runCommand(cmd: FfmpegCommand) {
 interface ExportRequest {
   clipId?: string
   fps?: number
+  yoyoCount?: number
+  overrideFps?: number
+}
+
+function parseNumber(value: unknown, fallback = 0) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : fallback
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
 }
 
 export async function POST(req: NextRequest) {
   try {
     ensureFfmpegAvailable()
 
-    const body: ExportRequest = await req.json()
-    const { clipId, fps = 10 } = body
+    const contentType = req.headers.get('content-type') || ''
+    let body: ExportRequest = {}
+    let customAudioFile: File | null = null
+
+    if (contentType.includes('application/json')) {
+      body = await req.json()
+    } else {
+      const formData = await req.formData()
+      body.clipId = formData.get('clipId') as string | null || undefined
+      body.fps = parseNumber(formData.get('fps'), 10)
+      body.overrideFps = parseNumber(formData.get('overrideFps'), 0) || undefined
+      body.yoyoCount = parseNumber(formData.get('yoyoCount'), 0) || undefined
+      const maybeAudio = formData.get('audio')
+      if (maybeAudio instanceof File) {
+        customAudioFile = maybeAudio
+      }
+    }
+
+    const { clipId, fps = 10, yoyoCount = 1, overrideFps = 0 } = body
 
     if (!clipId) {
       return NextResponse.json({ error: 'clipId is required' }, { status: 400 })
@@ -49,43 +77,100 @@ export async function POST(req: NextRequest) {
     await fs.rm(outputPath, { force: true })
 
     let frameNames: string[] = []
+    let encodedFps: number | null = null
     try {
       const metaRaw = await fs.readFile(path.join(baseDir, 'meta.json'), 'utf8')
       const meta = JSON.parse(metaRaw)
-      frameNames = Array.isArray(meta.frames)
-        ? meta.frames
-            .map((f: unknown) => (typeof f === 'object' && f && 'name' in f ? (f as { name: string }).name : null))
-            .filter((name): name is string => Boolean(name))
-        : []
+      if (typeof meta.fps === 'number' && Number.isFinite(meta.fps)) {
+        encodedFps = meta.fps
+      }
     } catch {}
 
-    if (frameNames.length === 0) {
-      frameNames = (await fs.readdir(sourceDir)).filter((n) => n.endsWith('.png')).sort()
-    }
+    frameNames = (await fs.readdir(sourceDir)).filter((n) => n.endsWith('.png')).sort()
 
     if (frameNames.length === 0) {
       return NextResponse.json({ error: 'No frames to export' }, { status: 404 })
     }
 
+    const effectiveFps = overrideFps > 0 ? overrideFps : fps > 0 ? fps : encodedFps || 10
+
     for (const name of frameNames) {
       const target = path.join(workingDir, name)
       const transformed = path.join(transformedDir, name)
       const source = path.join(sourceDir, name)
-      if (existsSync(transformed)) {
+      const transformedUsable =
+        existsSync(transformed) &&
+        (() => {
+          try {
+            return statSync(transformed).size > 0
+          } catch {
+            return false
+          }
+        })()
+
+      if (transformedUsable) {
         copyFileSync(transformed, target)
-      } else if (existsSync(source)) {
+        continue
+      }
+
+      if (existsSync(source)) {
         copyFileSync(source, target)
-      } else {
-        return NextResponse.json({ error: `Missing frame ${name}` }, { status: 404 })
+        continue
+      }
+
+      return NextResponse.json({ error: `Missing frame ${name}` }, { status: 404 })
+    }
+
+    // Build an explicit concat list to preserve ordering even with retries/gaps.
+    const listPath = path.join(workingDir, 'frames.txt')
+    const forward = frameNames
+    const backward = frameNames.slice(1, -1).reverse()
+    const loops = Math.max(1, Math.floor(yoyoCount) || 1)
+
+    const sequence: string[] = []
+    for (let i = 0; i < loops; i++) {
+      sequence.push(...forward)
+      if (loops > 1) {
+        sequence.push(...backward)
       }
     }
 
-    const cmd = ffmpeg()
-      .addInput(path.join(workingDir, 'frame_%04d.png'))
-      .inputOptions(['-framerate', String(fps)])
-      .outputOptions(['-c:v', 'libx264', '-pix_fmt', 'yuv420p'])
+    const listContent = sequence
+      .map((name) => `file '${path.join(workingDir, name).replace(/'/g, "'\\''")}'`)
+      .join('\n')
+    await fs.writeFile(listPath, listContent, 'utf8')
 
-    if (existsSync(audioPath)) {
+    const scaleFilter = 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+    const vf = `${scaleFilter},format=rgb24`
+
+    const useOriginalAudio =
+      existsSync(audioPath) && !customAudioFile && !(overrideFps > 0) && !(Math.max(1, Math.floor(yoyoCount) || 1) > 1)
+
+    // Prepare custom audio if provided
+    let customAudioPath: string | null = null
+    if (customAudioFile) {
+      const buf = Buffer.from(await customAudioFile.arrayBuffer())
+      customAudioPath = path.join(workingDir, 'custom_audio.mp3')
+      await fs.writeFile(customAudioPath, buf)
+    }
+
+    const cmd = ffmpeg()
+      .addInput(listPath)
+      .inputOptions(['-f', 'concat', '-safe', '0', '-r', String(effectiveFps)])
+      .outputOptions([
+        '-vf',
+        vf,
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        String(effectiveFps),
+      ])
+
+    if (customAudioPath) {
+      cmd.addInput(customAudioPath).outputOptions(['-shortest'])
+    } else if (useOriginalAudio) {
       cmd.addInput(audioPath).outputOptions(['-shortest'])
     }
 

@@ -1,5 +1,8 @@
 # Nano Banana Video
 
+<img width="2276" height="852" alt="image" src="https://github.com/user-attachments/assets/233e7325-6c55-42af-895f-f72ab0c6addf" />
+
+
 A minimal Next.js app to slice a 10s clip, extract 10fps (or custom) frames, stylize them sequentially with Gemini image preview models, and export an MP4 with optional yo-yo looping, custom audio, and FPS override. All session state (frames, prompt, clip selection) is persisted in IndexedDB so refreshes keep your place.
 
 ## Setup

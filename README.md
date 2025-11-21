@@ -41,3 +41,6 @@ A minimal Next.js app to slice a 10s clip, extract 10fps (or custom) frames, sty
 ## Scripts
 - `npm run dev` — start dev server
 - `npm run lint` — lint with ESLint
+
+## License
+MIT - see `LICENSE`.
